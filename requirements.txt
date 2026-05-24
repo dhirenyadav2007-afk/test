@@ -1,0 +1,10 @@
+pyrofork
+TgCrypto
+motor
+pymongo
+Pillow
+aiohttp
+pytz
+flask
+hachoir
+python-dotenv
