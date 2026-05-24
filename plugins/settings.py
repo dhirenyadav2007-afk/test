@@ -129,12 +129,15 @@ async def cb_setsource(client: Client, cq: CallbackQuery):
     label  = "✓ Fɪʟᴇɴᴀᴍᴇ" if src == "filename" else "Fɪʟᴇɴᴀᴍᴇ"
     label2 = "✓ Cᴀᴘᴛɪᴏɴ"  if src == "caption"  else "Cᴀᴘᴛɪᴏɴ"
     kb = ik([btn(label, cd="src_filename"), btn(label2, cd="src_caption")])
-    await cq.message.edit_text(
-        "ⓘ <b>𝗥𝗘𝗡𝗔𝗠𝗘 𝗦𝗢𝗨𝗥𝗖𝗘</b>\n\n"
-        "<blockquote>⓪ Cʜᴏᴏsᴇ ᴡʜᴇʀᴇ ᴛʜᴇ ʙᴏᴛ ᴇxᴛʀᴀᴄᴛs ᴠᴀʀɪᴀʙʟᴇs ꜰʀᴏᴍ (Fɪʟᴇɴᴀᴍᴇ ᴏʀ Cᴀᴘᴛɪᴏɴ).</blockquote>\n"
-        f"<blockquote>↳ <b>Cᴜʀʀᴇɴᴛ</b> : <code>{src.upper()}</code></blockquote>",
-        reply_markup=kb
-    )
+    try:
+        await cq.message.edit_text(
+            "ⓘ <b>𝗥𝗘𝗡𝗔𝗠𝗘 𝗦𝗢𝗨𝗥𝗖𝗘</b>\n\n"
+            "<blockquote>⓪ Cʜᴏᴏsᴇ ᴡʜᴇʀᴇ ᴛʜᴇ ʙᴏᴛ ᴇxᴛʀᴀᴄᴛs ᴠᴀʀɪᴀʙʟᴇs ꜰʀᴏᴍ (Fɪʟᴇɴᴀᴍᴇ ᴏʀ Cᴀᴘᴛɪᴏɴ).</blockquote>\n"
+            f"<blockquote>↳ <b>Cᴜʀʀᴇɴᴛ</b> : <code>{src.upper()}</code></blockquote>",
+            reply_markup=kb
+        )
+    except Exception:
+        pass
     await cq.answer(f"Source set to {src}", show_alert=False)
 
 
@@ -167,12 +170,15 @@ async def cb_setmedia(client: Client, cq: CallbackQuery):
     d_lbl = "✓ DOCUMENT" if pref == "document" else "DOCUMENT"
     v_lbl = "✓ VIDEO"    if pref == "video"    else "VIDEO"
     kb = ik([btn(d_lbl, cd="media_document"), btn(v_lbl, cd="media_video")])
-    await cq.message.edit_text(
-        "ⓘ <b>𝗠𝗘𝗗𝗜𝗔 𝗣𝗥𝗘𝗙𝗘𝗥𝗘𝗡𝗖𝗘</b>\n\n"
-        "<blockquote>◍ Cʜᴏᴏsᴇ ʜᴏᴡ ᴛʜᴇ ʙᴏᴛ sʜᴏᴜʟᴅ ʜᴀɴᴅʟᴇ ʏᴏᴜʀ ᴜᴘʟᴏᴀᴅᴇᴅ ꜰɪʟᴇs.</blockquote>\n"
-        f"<blockquote>➥ Cᴜʀʀᴇɴᴛ : <code>{pref.upper()}</code></blockquote>",
-        reply_markup=kb
-    )
+    try:
+        await cq.message.edit_text(
+            "ⓘ <b>𝗠𝗘𝗗𝗜𝗔 𝗣𝗥𝗘𝗙𝗘𝗥𝗘𝗡𝗖𝗘</b>\n\n"
+            "<blockquote>◍ Cʜᴏᴏsᴇ ʜᴏᴡ ᴛʜᴇ ʙᴏᴛ sʜᴏᴜʟᴅ ʜᴀɴᴅʟᴇ ʏᴏᴜʀ ᴜᴘʟᴏᴀᴅᴇᴅ ꜰɪʟᴇs.</blockquote>\n"
+            f"<blockquote>➥ Cᴜʀʀᴇɴᴛ : <code>{pref.upper()}</code></blockquote>",
+            reply_markup=kb
+        )
+    except Exception:
+        pass
     await cq.answer(f"Media type set to {pref}", show_alert=False)
 
 
