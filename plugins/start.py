@@ -146,10 +146,12 @@ async def start_cmd(client: Client, message: Message):
 @check_ban
 @check_fsub
 async def help_cmd(client: Client, message: Message):
-    pic  = Config.rand_pic("START")
-    text = Config.HELP_TXT
-    kb = ik([btn("« ʙᴀᴄᴋ", cd="start_back"),btn("✕ ᴄʟᴏsᴇ", cd="close_msg")])
-    await message.reply_photo( pic, caption=text, reply_markup=kb)
+    pic = Config.rand_pic("START")
+    kb = ik(
+        [btn("« ʙᴀᴄᴋ", cd="start_back"),
+         btn("✕ ᴄʟᴏsᴇ", cd="close_msg")],
+    )
+    await message.reply_photo(pic, caption=Config.HELP_TXT, reply_markup=kb)
 
 
 # ─── Callbacks: about / help / fsub_check / close ────────────────────────────
@@ -165,13 +167,16 @@ async def cb_about(client: Client, cq: CallbackQuery):
         [btn("« ʙᴀᴄᴋ", cd="start_back"),
          btn("✕ ᴄʟᴏsᴇ", cd="close_msg")],
     )
-    if pic:
-        await cq.message.edit_media(
-            __import__("pyrogram.types", fromlist=["InputMediaPhoto"]).InputMediaPhoto(pic, caption=text),
-            reply_markup=kb
-        )
-    else:
-        await cq.message.edit_text(text, reply_markup=kb)
+    try:
+        if pic:
+            await cq.message.edit_media(
+                __import__("pyrogram.types", fromlist=["InputMediaPhoto"]).InputMediaPhoto(pic, caption=text),
+                reply_markup=kb
+            )
+        else:
+            await cq.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        pass
     await cq.answer()
 
 
@@ -186,21 +191,30 @@ async def cb_start_back(client: Client, cq: CallbackQuery):
         [btn("ʜᴇʟᴘ", cd="help_home"),
          btn("ᴀʙᴏᴜᴛ",  cd="about_page")],
     )
-    if pic:
-        await cq.message.edit_media(
-            __import__("pyrogram.types", fromlist=["InputMediaPhoto"]).InputMediaPhoto(pic, caption=text),
-            reply_markup=kb
-        )
-    else:
-        await cq.message.edit_text(text, reply_markup=kb)
+    try:
+        if pic:
+            await cq.message.edit_media(
+                __import__("pyrogram.types", fromlist=["InputMediaPhoto"]).InputMediaPhoto(pic, caption=text),
+                reply_markup=kb
+            )
+        else:
+            await cq.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        pass
     await cq.answer()
 
 
 @Client.on_callback_query(filters.regex("^help_home$"))
 @check_ban
 async def cb_help(client: Client, cq: CallbackQuery):
-    kb = ik([btn("« ʙᴀᴄᴋ", cd="start_back"),btn("✕ ᴄʟᴏsᴇ", cd="close_msg")])
-    await cq.message.edit_text(Config.HELP_TXT, reply_markup=kb)
+    kb = ik(
+        [btn("« ʙᴀᴄᴋ", cd="start_back"),
+         btn("✕ ᴄʟᴏsᴇ", cd="close_msg")],
+    )
+    try:
+        await cq.message.edit_text(Config.HELP_TXT, reply_markup=kb)
+    except Exception:
+        pass
     await cq.answer()
 
 
@@ -290,7 +304,7 @@ async def _send_user_info(client, message, target):
         m = await message.reply_photo(pic, caption=text, reply_markup=kb)
     else:
         m = await message.reply_text(text, reply_markup=kb)
-    asyncio.get_event_loop().call_later(30, asyncio.ensure_future, _safe_delete(m))
+    asyncio.create_task(_auto_delete(m, 30))
 
 
 async def _safe_delete(msg):
@@ -298,6 +312,12 @@ async def _safe_delete(msg):
         await msg.delete()
     except Exception:
         pass
+
+
+async def _auto_delete(msg, delay: int):
+    """Delete a message after `delay` seconds."""
+    await asyncio.sleep(delay)
+    await _safe_delete(msg)
 
 
 # ─── /leaderboard ────────────────────────────────────────────────────────────
@@ -308,7 +328,7 @@ async def _safe_delete(msg):
 async def leaderboard_cmd(client: Client, message: Message):
     m = await message.reply_text("⟳ ʟᴏᴀᴅɪɴɢ ʟᴇᴀᴅᴇʀʙᴏᴀʀᴅ...")
     await _show_leaderboard(client, m, message.from_user.id, "today", edit=True)
-    asyncio.get_event_loop().call_later(60, asyncio.ensure_future, _safe_delete(m))
+    asyncio.create_task(_auto_delete(m, 60))
 
 
 async def _show_leaderboard(client, msg, viewer_id: int, period: str, edit=False):
@@ -338,10 +358,7 @@ async def _show_leaderboard(client, msg, viewer_id: int, period: str, edit=False
         [btn("✕ ᴄʟᴏsᴇ", cd="close_msg")],
     )
     try:
-        if edit:
-            await msg.edit_text(text, reply_markup=kb)
-        else:
-            await msg.edit_text(text, reply_markup=kb)
+        await msg.edit_text(text, reply_markup=kb)
     except Exception:
         pass
 
