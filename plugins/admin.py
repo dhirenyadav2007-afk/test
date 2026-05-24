@@ -146,11 +146,11 @@ async def deladmin_cmd(client: Client, message: Message):
 @Client.on_message(filters.command("status"))
 @owner_or_admin
 async def status_cmd(client: Client, message: Message):
-    from plugins.queue_cancel import queue_stats
+    from plugins.file_rename import get_global_stats
     total_users = await db.total_users_count()
     uptime_sec  = int(time.time() - BOT_START_TIME)
     uptime_str  = get_readable_time(uptime_sec)
-    gs          = queue_stats()
+    gs          = get_global_stats()
     shutdown    = await db.get_shutdown()
     fsub_on     = await db.get_fsub_enabled()
     admins      = await db.get_admins()
