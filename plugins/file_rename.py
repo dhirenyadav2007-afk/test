@@ -65,6 +65,7 @@ _done_map:    dict[int, int]            = {}   # files fully renamed
 _start_map:   dict[int, float]          = {}   # batch start timestamp
 _summary_map: dict[int, Message]        = {}   # the "Rename Started" message
 _cancel_map:  dict[int, bool]           = {}   # cancel flag
+_process_tasks: dict[int, list]         = {}   # uid → [Task, ...] for real cancellation
 
 # Dedup: file_id → last processed timestamp
 _dedup: dict[str, float] = {}
@@ -89,8 +90,9 @@ def get_global_stats() -> dict:
 
 
 def cancel_user(uid: int) -> None:
-    """Called by /cancel — drain queue and set flag."""
+    """Called by /cancel — drain queue, set flag, cancel live Tasks."""
     _cancel_map[uid] = True
+    # Drain pending queue
     q = _queue_map.get(uid)
     if q:
         while not q.empty():
@@ -98,6 +100,11 @@ def cancel_user(uid: int) -> None:
                 q.get_nowait()
             except asyncio.QueueEmpty:
                 break
+    # Cancel all live _process_one Tasks for this user
+    for task in list(_process_tasks.get(uid, [])):
+        if not task.done():
+            task.cancel()
+    _process_tasks.pop(uid, None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -167,51 +174,36 @@ async def _safe_download(
     uid: int = 0,
 ) -> str:
     """
-    Download with:
-      1. Windows file-lock safety  (pre-delete stale .temp, 3 retries).
-      2. Cancel support  — wraps download_media in asyncio.wait_for polling
-         the cancel flag every second so /cancel works mid-download.
-    Returns local path on success, raises on failure / cancellation.
+    Direct await of download_media — allows true asyncio parallelism.
+    Three separate _process_one Tasks each call this; asyncio interleaves
+    them naturally at every await point inside download_media.
+
+    Cancel is handled by cancelling the outer _process_one Task itself
+    (see cancel_user() which calls task.cancel() on stored tasks).
+
+    Windows file-lock safety: pre-delete stale .temp files, retry 3x.
     """
     _safe_del(file_path, file_path + ".temp", file_path + ".part")
 
     for attempt in range(1, 4):
-        # Check cancel before each attempt
         if uid and _cancel_map.get(uid):
             raise asyncio.CancelledError("Cancelled by user")
 
         try:
-            t0 = time.time()
-
-            # Run download_media in a Task so we can cancel it
-            dl_task = asyncio.ensure_future(
-                client.download_media(
-                    message,
-                    file_name=file_path,
-                    progress=progress_for_pyrogram,
-                    progress_args=(f"{prog_hdr}\n➥ Dᴏᴡɴʟᴏᴀᴅɪɴɢ...", prog_msg, t0),
-                )
+            t0     = time.time()
+            result = await client.download_media(
+                message,
+                file_name=file_path,
+                progress=progress_for_pyrogram,
+                progress_args=(f"{prog_hdr}\n➥ Dᴏᴡɴʟᴏᴀᴅɪɴɢ...", prog_msg, t0),
             )
-
-            # Poll cancel flag every 1 second while download runs
-            while not dl_task.done():
-                if uid and _cancel_map.get(uid):
-                    dl_task.cancel()
-                    try:
-                        await dl_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    _safe_del(file_path, file_path + ".temp", file_path + ".part")
-                    raise asyncio.CancelledError("Cancelled by user during download")
-                await asyncio.sleep(1)
-
-            result = dl_task.result()
             if result and os.path.exists(result):
                 return result
             raise RuntimeError("Download returned empty path")
 
         except asyncio.CancelledError:
-            raise   # propagate cancel
+            _safe_del(file_path, file_path + ".temp", file_path + ".part")
+            raise
 
         except PermissionError as e:
             if attempt < 3:
@@ -427,7 +419,9 @@ async def _on_slot_freed(client, uid: int) -> None:
         try:
             next_msg, next_prog = q.get_nowait()
             _active_map[uid] += 1
-            asyncio.create_task(_process_one(client, uid, next_msg, next_prog))
+            t = asyncio.create_task(_process_one(client, uid, next_msg, next_prog))
+            _process_tasks.setdefault(uid, []).append(t)
+            t.add_done_callback(lambda _t, u=uid: _process_tasks.get(u, []) and _process_tasks[u].remove(_t) if _t in _process_tasks.get(u, []) else None)
             await _edit_summary(uid)
             return
         except asyncio.QueueEmpty:
@@ -710,7 +704,9 @@ async def auto_rename_files(client, message: Message) -> None:
         # Free slot → start now (prog_msg gets edited to download bar)
         if _active_map.get(uid, 0) < CONCURRENT:
             _active_map[uid] = _active_map.get(uid, 0) + 1
-            asyncio.create_task(_process_one(client, uid, message, prog_msg))
+            t = asyncio.create_task(_process_one(client, uid, message, prog_msg))
+            _process_tasks.setdefault(uid, []).append(t)
+            t.add_done_callback(lambda _t, u=uid: _process_tasks.get(u, []) and _process_tasks[u].remove(_t) if _t in _process_tasks.get(u, []) else None)
             await _edit_summary(uid)
 
         # No free slot → park in queue; _on_slot_freed will start it
