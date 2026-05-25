@@ -1,27 +1,44 @@
 """
-plugins/file_rename.py — Complete rename engine.
+plugins/file_rename.py  —  Complete rename engine.
 
-Queue behaviour:
-  • Every file sent → immediately gets its own "N file added to queue" message.
-  • First 3 files: their queue message is immediately edited to download bar.
-  • Files 4+: keep "added to queue N" until a slot frees.
-  • When slot frees → that file's OWN message is edited to download bar.
-  • Single summary message updated throughout; "All Completed" at the end.
+ARCHITECTURE: Pipeline model (not naive 3-simultaneous)
+─────────────────────────────────────────────────────────────────────────────
+Pyrogram/pyrofork serialises downloads internally (one active download per
+DC at a time). Attempting 3 concurrent download_media calls results in
+2 of 3 stuck showing "Downloading..." with zero progress — exactly the
+bug the user saw.
 
-Windows file-lock fix:
-  • Pyrogram downloads to a .temp file then calls shutil.move().
-  • On Windows, if the destination already exists, shutil.move → os.rename
-    fails with WinError 32 (file in use). We pre-delete any stale destination
-    before downloading, and wrap the download in a retry loop with a short
-    delay so a previous task's cleanup has time to finish.
+The CORRECT architecture for a rename bot is a PIPELINE:
 
-Metadata {filename} fix:
-  • Every metadata field is passed through _resolve(value, new_name) which
-    replaces {filename} with the actual renamed filename before calling ffmpeg.
+  Slot A:  [DOWNLOAD 1] → [META 1] → [UPLOAD 1]
+  Slot B:              [DOWNLOAD 2] → [META 2] → [UPLOAD 2]
+  Slot C:                          [DOWNLOAD 3] → [META 3] → [UPLOAD 3]
+
+This gives REAL concurrency: while file 1 is uploading, file 2 is having
+metadata injected, and file 3 is downloading.  At any moment up to 3 files
+are in-flight simultaneously — just at different stages.
+
+A single global _DL_SEM(1) limits downloads to one at a time (matching
+pyrofork reality).  A global _UL_SEM(3) allows up to 3 concurrent uploads.
+ffmpeg metadata injection has no semaphore — it uses CPU, not network.
+
+Queue behaviour (unchanged):
+  • Every incoming file gets its own "N file added to queue" message.
+  • When a processing slot opens, that message is edited to a progress bar.
+  • One summary message tracks total/renamed/active counts.
+  • "All Completed" summary sent when batch finishes.
+
+Cancel:
+  • /cancel sets _cancel_map[uid]=True and cancels all live Tasks.
+  • _safe_download checks the flag and raises CancelledError.
+
+Windows WinError 32:
+  • Pre-delete stale .temp files before each download attempt.
+  • 300 ms sleep in finally block before file deletion on Windows.
+  • 3 retry attempts with 2 s backoff on PermissionError.
 """
 
 import os
-import re
 import sys
 import time
 import asyncio
@@ -47,31 +64,39 @@ from plugins.start import check_ban, check_fsub, check_shutdown
 logger = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CONSTANTS
+#  CONCURRENCY CONTROLS
 # ══════════════════════════════════════════════════════════════════════════════
-CONCURRENT    = 3     # simultaneous files per user
-_DEDUP_WINDOW = 10    # seconds — ignore re-delivered file_ids
-_IS_WINDOWS   = sys.platform == "win32"
+CONCURRENT   = 3              # max files in-flight per user at once
+_IS_WINDOWS  = sys.platform == "win32"
+
+# One download at a time globally — matches pyrofork's real capability.
+# pyrofork serialises GetFile requests per DC; trying >1 concurrent download
+# leaves all but one stuck with zero progress callbacks.
+_DL_SEM  = asyncio.Semaphore(1)
+
+# Up to 3 concurrent uploads (Telegram allows this fine).
+_UL_SEM  = asyncio.Semaphore(3)
+
+_DEDUP_WINDOW = 10   # seconds
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  PER-USER BATCH STATE  (all keyed by uid)
 # ══════════════════════════════════════════════════════════════════════════════
-_lock_map:    dict[int, asyncio.Lock]   = {}   # serialises slot management
-_queue_map:   dict[int, asyncio.Queue]  = {}   # pending (message, prog_msg) pairs
-_active_map:  dict[int, int]            = {}   # files currently processing
-_total_map:   dict[int, int]            = {}   # files received this batch
-_done_map:    dict[int, int]            = {}   # files fully renamed
-_start_map:   dict[int, float]          = {}   # batch start timestamp
-_summary_map: dict[int, Message]        = {}   # the "Rename Started" message
-_cancel_map:  dict[int, bool]           = {}   # cancel flag
-_process_tasks: dict[int, list]         = {}   # uid → [Task, ...] for real cancellation
+_lock_map:     dict[int, asyncio.Lock]  = {}
+_queue_map:    dict[int, asyncio.Queue] = {}
+_active_map:   dict[int, int]           = {}   # files currently processing
+_total_map:    dict[int, int]           = {}   # files received this batch
+_done_map:     dict[int, int]           = {}   # files fully renamed
+_start_map:    dict[int, float]         = {}   # batch start timestamp
+_summary_map:  dict[int, Message]       = {}   # the summary message
+_cancel_map:   dict[int, bool]          = {}   # cancel flag
+_process_tasks:dict[int, list]          = {}   # uid → [Task, ...]
 
-# Dedup: file_id → last processed timestamp
 _dedup: dict[str, float] = {}
 
 
-# ── Public helpers used by queue_cancel.py ───────────────────────────────────
+# ── Public helpers (used by queue_cancel.py and admin.py) ────────────────────
 def get_user_stats(uid: int) -> dict:
     q = _queue_map.get(uid)
     return {
@@ -90,9 +115,8 @@ def get_global_stats() -> dict:
 
 
 def cancel_user(uid: int) -> None:
-    """Called by /cancel — drain queue, set flag, cancel live Tasks."""
+    """Drain queue, set flag, cancel all live Tasks for this user."""
     _cancel_map[uid] = True
-    # Drain pending queue
     q = _queue_map.get(uid)
     if q:
         while not q.empty():
@@ -100,7 +124,6 @@ def cancel_user(uid: int) -> None:
                 q.get_nowait()
             except asyncio.QueueEmpty:
                 break
-    # Cancel all live _process_one Tasks for this user
     for task in list(_process_tasks.get(uid, [])):
         if not task.done():
             task.cancel()
@@ -117,7 +140,6 @@ def _get_lock(uid: int) -> asyncio.Lock:
 
 
 def _safe_del(*paths) -> None:
-    """Delete files silently, never raises."""
     for p in paths:
         if p and os.path.exists(p):
             try:
@@ -133,7 +155,7 @@ def _mkdirs(*paths) -> None:
 
 
 def _resolve(value: str | None, new_name: str) -> str:
-    """Replace {filename} placeholder in a metadata field with the real name."""
+    """Replace {filename} placeholder with the real renamed filename."""
     if not value:
         return ""
     return value.replace("{filename}", new_name)
@@ -144,7 +166,6 @@ def _is_batch_alive(uid: int) -> bool:
 
 
 def _init_user(uid: int) -> None:
-    """Create fresh batch state. Call BEFORE acquiring the lock."""
     _lock_map[uid]    = asyncio.Lock()
     _queue_map[uid]   = asyncio.Queue()
     _active_map[uid]  = 0
@@ -156,68 +177,101 @@ def _init_user(uid: int) -> None:
 
 
 def _cleanup_user(uid: int) -> None:
-    """Tear down all batch state once the batch is fully complete."""
     for d in (_lock_map, _queue_map, _active_map, _total_map,
-              _done_map, _start_map, _summary_map, _cancel_map):
+              _done_map, _start_map, _summary_map, _cancel_map,
+              _process_tasks):
         d.pop(uid, None)
 
 
+def _track_task(uid: int, task: asyncio.Task) -> None:
+    _process_tasks.setdefault(uid, []).append(task)
+    def _on_done(t):
+        lst = _process_tasks.get(uid, [])
+        if t in lst:
+            lst.remove(t)
+    task.add_done_callback(_on_done)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  WINDOWS FILE-LOCK SAFE DOWNLOAD
+#  DOWNLOAD  (global semaphore = 1)
 # ══════════════════════════════════════════════════════════════════════════════
 async def _safe_download(
     client,
     message: Message,
     file_path: str,
-    prog_hdr: str,
+    prog_hdr: str,   # original filename header for display
     prog_msg: Message,
     uid: int = 0,
 ) -> str:
     """
-    Direct await of download_media — allows true asyncio parallelism.
-    Three separate _process_one Tasks each call this; asyncio interleaves
-    them naturally at every await point inside download_media.
-
-    Cancel is handled by cancelling the outer _process_one Task itself
-    (see cancel_user() which calls task.cancel() on stored tasks).
-
-    Windows file-lock safety: pre-delete stale .temp files, retry 3x.
+    Download one file with:
+      • Global _DL_SEM(1) — only 1 download active at a time.
+        Files waiting for the semaphore show "Waiting to download…"
+        then the bar appears the moment they acquire the slot.
+      • Windows WinError 32 safety (pre-delete + retry).
+      • Cancel check before and after acquiring the semaphore.
     """
-    _safe_del(file_path, file_path + ".temp", file_path + ".part")
+    if uid and _cancel_map.get(uid):
+        raise asyncio.CancelledError("Cancelled before download")
 
-    for attempt in range(1, 4):
+    # Show waiting state while another file holds the download slot
+    try:
+        await prog_msg.edit(
+            f"{prog_hdr}\n"
+            "⧗ Wᴀɪᴛɪɴɢ ꜰᴏʀ ᴅᴏᴡɴʟᴏᴀᴅ sʟᴏᴛ..."
+        )
+    except Exception:
+        pass
+
+    async with _DL_SEM:
         if uid and _cancel_map.get(uid):
-            raise asyncio.CancelledError("Cancelled by user")
+            raise asyncio.CancelledError("Cancelled while waiting for download slot")
 
-        try:
-            t0     = time.time()
-            result = await client.download_media(
-                message,
-                file_name=file_path,
-                progress=progress_for_pyrogram,
-                progress_args=(f"{prog_hdr}\n➥ Dᴏᴡɴʟᴏᴀᴅɪɴɢ...", prog_msg, t0),
-            )
-            if result and os.path.exists(result):
-                return result
-            raise RuntimeError("Download returned empty path")
+        # Pre-delete stale files (Windows WinError 32 prevention)
+        _safe_del(file_path, file_path + ".temp", file_path + ".part")
 
-        except asyncio.CancelledError:
-            _safe_del(file_path, file_path + ".temp", file_path + ".part")
-            raise
+        for attempt in range(1, 4):
+            if uid and _cancel_map.get(uid):
+                raise asyncio.CancelledError("Cancelled during download")
+            try:
+                t0 = time.time()
+                # Edit to show actual download is now starting
+                try:
+                    await prog_msg.edit(f"{prog_hdr}\n➥ Dᴏᴡɴʟᴏᴀᴅɪɴɢ...")
+                except Exception:
+                    pass
 
-        except PermissionError as e:
-            if attempt < 3:
-                logger.warning(
-                    f"Download PermissionError attempt {attempt}/3 "
-                    f"file={os.path.basename(file_path)}: {e} — retrying in 2s"
+                result = await client.download_media(
+                    message,
+                    file_name=file_path,
+                    progress=progress_for_pyrogram,
+                    progress_args=(
+                        f"{prog_hdr}\n➥ Dᴏᴡɴʟᴏᴀᴅɪɴɢ...",
+                        prog_msg,
+                        t0,
+                    ),
                 )
-                _safe_del(file_path + ".temp")
-                await asyncio.sleep(2)
-            else:
+                if result and os.path.exists(result):
+                    return result
+                raise RuntimeError("Download returned empty path")
+
+            except asyncio.CancelledError:
+                _safe_del(file_path, file_path + ".temp", file_path + ".part")
                 raise
 
-        except Exception:
-            raise
+            except PermissionError as e:
+                if attempt < 3:
+                    logger.warning(
+                        f"Download PermissionError attempt {attempt}/3 "
+                        f"file={os.path.basename(file_path)}: {e} — retrying 2s"
+                    )
+                    _safe_del(file_path + ".temp")
+                    await asyncio.sleep(2)
+                else:
+                    raise
+
+            except Exception:
+                raise
 
     raise RuntimeError("Download failed after 3 attempts")
 
@@ -255,7 +309,7 @@ async def _ffmpeg_run(cmd: list, uid: int, timeout: int = 180) -> bool:
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         if proc.returncode != 0:
             logger.warning(
-                f"ffmpeg non-zero uid={uid}: {stderr.decode(errors='replace')[:300]}"
+                f"ffmpeg uid={uid}: {stderr.decode(errors='replace')[:200]}"
             )
             return False
         return True
@@ -275,19 +329,14 @@ async def _build_meta_cmd(
     new_name: str,
     to_mkv: bool = False,
 ) -> list:
-    """
-    Build ffmpeg stream-copy command with all metadata fields.
-    {filename} in any field is resolved to new_name before being passed.
-    """
+    """All 9 metadata fields fetched in parallel, {filename} resolved."""
     (title, artist, author, vid, aud, sub,
      enc, ctag, cmt) = await asyncio.gather(
-        db.get_title(uid),      db.get_artist(uid),   db.get_author(uid),
-        db.get_video(uid),      db.get_audio(uid),    db.get_subtitle(uid),
-        db.get_encoded_by(uid), db.get_custom_tag(uid), db.get_comment(uid),
+        db.get_title(uid),       db.get_artist(uid),   db.get_author(uid),
+        db.get_video(uid),       db.get_audio(uid),    db.get_subtitle(uid),
+        db.get_encoded_by(uid),  db.get_custom_tag(uid), db.get_comment(uid),
     )
-
-    r = lambda v: _resolve(v, new_name)     # noqa: E731
-
+    r = lambda v: _resolve(v, new_name)
     cmd = [
         ffmpeg, "-hide_banner", "-y", "-i", input_path,
         "-metadata",     f"title={r(title)}",
@@ -313,25 +362,19 @@ async def _apply_ffmpeg(
     new_name: str,
     to_mkv: bool = False,
 ) -> str:
-    """
-    Run ffmpeg. Returns output_path on success, input_path on failure.
-    On Windows, ensure output_path doesn't already exist to avoid lock issues.
-    """
+    """Run ffmpeg. Returns output_path on success, input_path on failure."""
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        logger.debug("ffmpeg not found, skipping metadata injection")
+        logger.debug("ffmpeg not found — skipping metadata")
         return input_path
-
-    # Pre-delete output to avoid WinError 32
-    _safe_del(output_path)
-
+    _safe_del(output_path)   # avoid WinError 32
     cmd = await _build_meta_cmd(ffmpeg, input_path, output_path, uid, new_name, to_mkv)
     ok  = await _ffmpeg_run(cmd, uid, timeout=300 if to_mkv else 180)
     return output_path if (ok and os.path.exists(output_path)) else input_path
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  DUMP CHANNEL  (fire-and-forget)
+#  DUMP CHANNEL
 # ══════════════════════════════════════════════════════════════════════════════
 async def _send_dump(
     client, uid: int,
@@ -369,17 +412,16 @@ async def _edit_summary(uid: int, done: bool = False) -> None:
     if not msg:
         return
 
-    elapsed = time.time() - _start_map.get(uid, time.time())
-    h, rem  = divmod(int(elapsed), 3600)
-    m, s    = divmod(rem, 60)
-    t_str   = f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
-
-    total   = _total_map.get(uid, 0)
-    renamed = _done_map.get(uid, 0)
-    active  = _active_map.get(uid, 0)
-    avg     = (elapsed / renamed) if renamed > 0 else 0
-    am, as_ = divmod(int(avg), 60)
-    avg_str = f"{am}m {as_}s"
+    elapsed  = time.time() - _start_map.get(uid, time.time())
+    h, rem   = divmod(int(elapsed), 3600)
+    m, s     = divmod(rem, 60)
+    t_str    = f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
+    total    = _total_map.get(uid, 0)
+    renamed  = _done_map.get(uid, 0)
+    active   = _active_map.get(uid, 0)
+    avg      = elapsed / renamed if renamed > 0 else 0
+    am, as_  = divmod(int(avg), 60)
+    avg_str  = f"{am}m {as_}s"
 
     if done:
         text = (
@@ -408,10 +450,7 @@ async def _edit_summary(uid: int, done: bool = False) -> None:
 #  SLOT MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
 async def _on_slot_freed(client, uid: int) -> None:
-    """
-    Must be called INSIDE _get_lock(uid).
-    Decrements active count; pulls next queued file or signals batch done.
-    """
+    """Must be called INSIDE _get_lock(uid)."""
     _active_map[uid] = max(0, _active_map.get(uid, 1) - 1)
     q = _queue_map.get(uid)
 
@@ -419,9 +458,10 @@ async def _on_slot_freed(client, uid: int) -> None:
         try:
             next_msg, next_prog = q.get_nowait()
             _active_map[uid] += 1
-            t = asyncio.create_task(_process_one(client, uid, next_msg, next_prog))
-            _process_tasks.setdefault(uid, []).append(t)
-            t.add_done_callback(lambda _t, u=uid: _process_tasks.get(u, []) and _process_tasks[u].remove(_t) if _t in _process_tasks.get(u, []) else None)
+            t = asyncio.create_task(
+                _process_one(client, uid, next_msg, next_prog)
+            )
+            _track_task(uid, t)
             await _edit_summary(uid)
             return
         except asyncio.QueueEmpty:
@@ -444,12 +484,12 @@ async def _process_one(
     prog_msg: Message,
 ) -> None:
     """
-    Full pipeline for a single file. prog_msg is the "N file added to queue"
-    message that we edit in-place throughout download → metadata → upload.
-    On finish (success/fail) calls _on_slot_freed() to chain the next file.
-    """
+    Pipeline for one file:
+      wait-for-dl-slot → download → metadata/convert → upload → dump → cleanup
 
-    # ── File info ──────────────────────────────────────────────────────────────
+    prog_msg = the "N file added to queue" message, edited throughout.
+    On finish → _on_slot_freed() chains the next queued file.
+    """
     file_obj  = message.document or message.video or message.audio
     if not file_obj:
         async with _get_lock(uid):
@@ -468,25 +508,22 @@ async def _process_one(
     # ── Dedup ─────────────────────────────────────────────────────────────────
     now = time.time()
     if now - _dedup.get(file_id, 0) < _DEDUP_WINDOW:
-        logger.debug(f"Skipping duplicate file_id={file_id} uid={uid}")
         async with _get_lock(uid):
             await _on_slot_freed(client, uid)
         return
     _dedup[file_id] = now
 
-    # ── Extension ──────────────────────────────────────────────────────────────
+    # ── Extension ─────────────────────────────────────────────────────────────
     _, ext    = os.path.splitext(orig_name)
     ext       = ext.lower() if ext else ".mkv"
     is_mp4    = ext in (".mp4", ".m4v")
     final_ext = ".mkv" if is_mp4 else ext
 
-    # ── Rename source ──────────────────────────────────────────────────────────
+    # ── Rename source / template ───────────────────────────────────────────────
     src_pref    = await db.get_rename_source(uid)
     source_text = (
         (message.caption or orig_name) if src_pref == "caption" else orig_name
     )
-
-    # ── Format template ────────────────────────────────────────────────────────
     template = await db.get_format_template(uid)
     if not template:
         try:
@@ -506,108 +543,123 @@ async def _process_one(
     new_name = f"{base}{final_ext}"
 
     # ── Paths ──────────────────────────────────────────────────────────────────
-    u       = str(uid)
-    dl_path = os.path.join("downloads", u, new_name)
-    md_path = os.path.join("metadata",  u, new_name)
+    u        = str(uid)
+    dl_path  = os.path.join("downloads", u, new_name)
+    md_path  = os.path.join("metadata",  u, new_name)
     _mkdirs(dl_path, md_path)
 
-    # orig_hdr → shown during download (original filename user sent)
-    # new_hdr  → shown during upload   (the renamed output name)
+    # Headers: original filename during download, renamed during upload
     orig_hdr = f"❐ <code>{orig_name}</code>"
     new_hdr  = f"❐ <code>{new_name}</code>"
 
     dl_result  = None
     final_path = None
     ph_path    = None
-    keep_prog  = False    # True → error message, don't delete prog_msg
+    keep_prog  = False   # if True = error shown, don't delete prog_msg
 
     try:
         if _cancel_map.get(uid):
             return
 
-        # ── DOWNLOAD ────────────────────────────────────────────────────────────
-        # Show ORIGINAL filename during download so user knows what's being fetched
-        await prog_msg.edit(f"{orig_hdr}\n➥ Dᴏᴡɴʟᴏᴀᴅɪɴɢ...")
-
-        dl_result = await _safe_download(client, message, dl_path, orig_hdr, prog_msg, uid)
+        # ── DOWNLOAD ──────────────────────────────────────────────────────────
+        # _safe_download acquires _DL_SEM(1) — only 1 download at a time.
+        # Files waiting show "Waiting for download slot…" until slot is free.
+        dl_result = await _safe_download(
+            client, message, dl_path, orig_hdr, prog_msg, uid
+        )
 
         if _cancel_map.get(uid):
             return
 
-        # ── METADATA / MKV CONVERSION ───────────────────────────────────────────
+        # ── METADATA / MKV ────────────────────────────────────────────────────
         meta_on = await db.get_metadata_mode(uid)
-
         if is_mp4:
-            await prog_msg.edit(f"{new_hdr}\n➥ Cᴏɴᴠᴇʀᴛɪɴɢ MP4 → MKV + Mᴇᴛᴀᴅᴀᴛᴀ...")
+            try:
+                await prog_msg.edit(
+                    f"{new_hdr}\n➥ Cᴏɴᴠᴇʀᴛɪɴɢ MP4 → MKV + Mᴇᴛᴀᴅᴀᴛᴀ..."
+                )
+            except Exception:
+                pass
             final_path = await _apply_ffmpeg(
                 dl_result, md_path, uid, new_name, to_mkv=True
             )
         elif meta_on:
-            await prog_msg.edit(f"{new_hdr}\n➥ Aᴅᴅɪɴɢ Mᴇᴛᴀᴅᴀᴛᴀ...")
+            try:
+                await prog_msg.edit(f"{new_hdr}\n➥ Aᴅᴅɪɴɢ Mᴇᴛᴀᴅᴀᴛᴀ...")
+            except Exception:
+                pass
             final_path = await _apply_ffmpeg(
                 dl_result, md_path, uid, new_name, to_mkv=False
             )
         else:
             final_path = dl_result
 
-        # ── THUMBNAIL ──────────────────────────────────────────────────────────
+        # ── THUMBNAIL ─────────────────────────────────────────────────────────
         ph_path = await _get_thumbnail(client, uid, message)
 
-        # ── DURATION ───────────────────────────────────────────────────────────
+        # ── DURATION ──────────────────────────────────────────────────────────
         duration = 0.0
         if media_src in ("video", "audio"):
             duration = await detect_duration(final_path)
 
-        # ── CAPTION ────────────────────────────────────────────────────────────
+        # ── CAPTION ───────────────────────────────────────────────────────────
         cap_tpl = await db.get_caption(uid)
         caption = (
             apply_caption_template(
                 cap_tpl, new_name, source_text, file_size, duration
-            ) if cap_tpl
-            else f"<b>{new_name}</b>"
+            ) if cap_tpl else f"<b>{new_name}</b>"
         )
 
-        # ── MEDIA PREFERENCE ────────────────────────────────────────────────────
-        pref = await db.get_media_preference(uid)
-        # Audio files always upload as audio regardless of user pref
+        # ── MEDIA PREFERENCE ──────────────────────────────────────────────────
+        pref      = await db.get_media_preference(uid)
         upload_as = media_src if message.audio else pref
 
-        # ── UPLOAD ─────────────────────────────────────────────────────────────
-        await prog_msg.edit(f"{new_hdr}\n➥ Uᴘʟᴏᴀᴅɪɴɢ...")
-        t1 = time.time()
-        kw = dict(
-            chat_id=message.chat.id,
-            caption=caption,
-            thumb=ph_path,
-            progress=progress_for_pyrogram,
-            progress_args=(f"{new_hdr}\n➥ Uᴘʟᴏᴀᴅɪɴɢ...", prog_msg, t1),
-        )
+        # ── UPLOAD  (up to 3 concurrent via _UL_SEM) ─────────────────────────
+        try:
+            await prog_msg.edit(f"{new_hdr}\n➥ Uᴘʟᴏᴀᴅɪɴɢ...")
+        except Exception:
+            pass
 
-        sent = None
-        if upload_as == "video":
-            sent = await client.send_video(
-                video=final_path,
-                duration=int(duration) if duration else 0,
-                supports_streaming=True,
-                **kw,
+        async with _UL_SEM:
+            t1 = time.time()
+            kw = dict(
+                chat_id=message.chat.id,
+                caption=caption,
+                thumb=ph_path,
+                progress=progress_for_pyrogram,
+                progress_args=(
+                    f"{new_hdr}\n➥ Uᴘʟᴏᴀᴅɪɴɢ...",
+                    prog_msg,
+                    t1,
+                ),
             )
-        elif upload_as == "audio":
-            sent = await client.send_audio(
-                audio=final_path,
-                duration=int(duration) if duration else 0,
-                **kw,
-            )
-        else:
-            sent = await client.send_document(document=final_path, **kw)
+            sent = None
+            if upload_as == "video":
+                sent = await client.send_video(
+                    video=final_path,
+                    duration=int(duration) if duration else 0,
+                    supports_streaming=True,
+                    **kw,
+                )
+            elif upload_as == "audio":
+                sent = await client.send_audio(
+                    audio=final_path,
+                    duration=int(duration) if duration else 0,
+                    **kw,
+                )
+            else:
+                sent = await client.send_document(document=final_path, **kw)
 
-        # ── DUMP CHANNEL ────────────────────────────────────────────────────────
+        # ── DUMP ──────────────────────────────────────────────────────────────
         if Config.DUMP_CHANNEL and sent:
             asyncio.create_task(
-                _send_dump(client, uid, message, sent,
-                           orig_name, new_name, file_size, ph_path, upload_as)
+                _send_dump(
+                    client, uid, message, sent,
+                    orig_name, new_name, file_size, ph_path, upload_as,
+                )
             )
 
-        # ── UPDATE DB STATS ─────────────────────────────────────────────────────
+        # ── DB stats ──────────────────────────────────────────────────────────
         await db.increment_rename(
             uid,
             message.from_user.first_name,
@@ -633,27 +685,26 @@ async def _process_one(
             pass
 
     finally:
-        # Delete progress message unless it's an error we want to show
+        # Delete progress message (unless showing an error)
         if not keep_prog:
             try:
                 await prog_msg.delete()
             except Exception:
                 pass
 
-        # Clean up all temp files — always, even on error
-        # On Windows we must ensure the files are not open before deleting.
-        # Small sleep gives the OS time to release any handles.
+        # Windows: give OS 300 ms to release file handles before deletion
         if _IS_WINDOWS:
             await asyncio.sleep(0.3)
 
-        paths_to_del = set(filter(None, [dl_path, md_path]))
-        if final_path and final_path not in paths_to_del:
-            paths_to_del.add(final_path)
-        _safe_del(*paths_to_del)
+        # Clean up all temp files
+        to_del = {dl_path, md_path}
+        if final_path and final_path not in to_del:
+            to_del.add(final_path)
+        _safe_del(*to_del)
         if ph_path:
             _safe_del(ph_path)
 
-        # Release slot and pull next queued file
+        # Free this slot and start the next queued file
         async with _get_lock(uid):
             await _on_slot_freed(client, uid)
 
@@ -670,7 +721,6 @@ async def _process_one(
 async def auto_rename_files(client, message: Message) -> None:
     uid = message.from_user.id
 
-    # ── Guard: format must be set ────────────────────────────────────────────
     if not await db.get_format_template(uid):
         await message.reply_text(
             "<blockquote>ⓘ Pʟᴇᴀsᴇ sᴇᴛ ᴀ ʀᴇɴᴀᴍᴇ ꜰᴏʀᴍᴀᴛ ꜰɪʀsᴛ ᴜsɪɴɢ "
@@ -678,7 +728,6 @@ async def auto_rename_files(client, message: Message) -> None:
         )
         return
 
-    # ── Init batch state on very first file ────────────────────────────────
     if not _is_batch_alive(uid):
         _init_user(uid)
 
@@ -686,7 +735,7 @@ async def auto_rename_files(client, message: Message) -> None:
         _total_map[uid] = _total_map.get(uid, 0) + 1
         file_num        = _total_map[uid]
 
-        # Create the summary message exactly ONCE per batch (on file #1)
+        # Create the single summary message on the very first file
         if file_num == 1:
             _start_map[uid]   = time.time()
             _summary_map[uid] = await message.reply_text(
@@ -696,20 +745,20 @@ async def auto_rename_files(client, message: Message) -> None:
                 "◍ Fɪʟᴇs Rᴇɴᴀᴍᴇᴅ    : <code>« 0 »</code>"
             )
 
-        # Every file gets its own queue message IMMEDIATELY
+        # Every file gets its own message immediately
         prog_msg = await message.reply_text(
             f"<blockquote>{file_num} ꜰɪʟᴇ ᴀᴅᴅᴇᴅ ᴛᴏ ǫᴜᴇᴜᴇ....</blockquote>"
         )
 
-        # Free slot → start now (prog_msg gets edited to download bar)
         if _active_map.get(uid, 0) < CONCURRENT:
+            # Free slot: start processing right away
             _active_map[uid] = _active_map.get(uid, 0) + 1
-            t = asyncio.create_task(_process_one(client, uid, message, prog_msg))
-            _process_tasks.setdefault(uid, []).append(t)
-            t.add_done_callback(lambda _t, u=uid: _process_tasks.get(u, []) and _process_tasks[u].remove(_t) if _t in _process_tasks.get(u, []) else None)
+            t = asyncio.create_task(
+                _process_one(client, uid, message, prog_msg)
+            )
+            _track_task(uid, t)
             await _edit_summary(uid)
-
-        # No free slot → park in queue; _on_slot_freed will start it
         else:
+            # No free slot: park in queue (will be pulled by _on_slot_freed)
             await _queue_map[uid].put((message, prog_msg))
             await _edit_summary(uid)
