@@ -1,10 +1,25 @@
-pyrofork
-TgCrypto
-motor
-pymongo
-Pillow
-aiohttp
-pytz
-flask
-hachoir
-python-dotenv
+# ── Telegram client ──────────────────────────────────────────────────────────
+pyrofork                  # Pyrogram fork with blockquote + modern TG features
+TgCrypto                  # C-extension for MTProto encryption (required by pyrogram)
+
+# ── Database ─────────────────────────────────────────────────────────────────
+motor                     # Async MongoDB driver (uses asyncio)
+pymongo                   # Motor dependency + sync utilities
+
+# ── Image processing ─────────────────────────────────────────────────────────
+Pillow                    # PIL — thumbnail conversion to JPEG
+
+# ── Keep-alive web server ─────────────────────────────────────────────────────
+flask                     # Minimal HTTP server for uptime pings (Koyeb/Railway/Render)
+
+# ── Timezone handling ────────────────────────────────────────────────────────
+pytz                      # Timezone-aware datetimes (restart msg IST timestamp)
+
+# ── Environment variables ────────────────────────────────────────────────────
+python-dotenv             # Loads .env file into os.environ on startup
+
+# ── Async HTTP (optional — for future aiohttp download support) ───────────────
+aiohttp                   # Async HTTP client (non-blocking web requests)
+
+# ── Event loop performance (Linux/Mac only — skip on Windows) ────────────────
+uvloop; sys_platform != "win32"   # Drop-in asyncio replacement, 2-4x faster
