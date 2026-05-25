@@ -63,6 +63,8 @@ class AniRenameBot(Client):
 
     async def start(self):
         await super().start()
+        from plugins.file_rename import start_workers
+        start_workers()
         me = await self.get_me()
         self.me = me
         logger.info(f"✅ {me.first_name} (@{me.username}) started!")
@@ -81,10 +83,10 @@ class AniRenameBot(Client):
         )
         restart_kb = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("ᴜᴘᴅᴀᴛᴇs",   url=Config.UPDATE_CHANNEL),
-                InlineKeyboardButton("ᴄʜᴇᴄᴋ Bᴏᴛ", url=f"https://t.me/{Config.BOT_USERNAME}"),
+                InlineKeyboardButton("UPDATES ↗",   url=Config.UPDATE_CHANNEL),
+                InlineKeyboardButton("CHECK BOT ↗", url=f"https://t.me/{Config.BOT_USERNAME}"),
             ],
-            [InlineKeyboardButton("Dᴇᴠ", url=Config.SUPPORT_LINK)],
+            [InlineKeyboardButton("DEV ↗", url=Config.SUPPORT_LINK)],
         ])
 
         for chat_id in [Config.LOG_CHANNEL, Config.SUPPORT_CHAT]:
@@ -94,7 +96,7 @@ class AniRenameBot(Client):
                         chat_id=chat_id,
                         photo=restart_pic,
                         caption=restart_text,
-                        reply_markup=restart_kb,         
+                        reply_markup=restart_kb,
                     )
                 else:
                     await self.send_message(
